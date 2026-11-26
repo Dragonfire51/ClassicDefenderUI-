@@ -12,6 +12,11 @@
 #include "../Settings.h"
 
 class ReportsView;
+class ProgressTracker;
+
+namespace ui {
+class ProgressWindow;
+}
 
 struct StatusResult {
     DefenderStatus status;
@@ -28,7 +33,7 @@ struct OperationResult {
     bool success = false;
 };
 
-enum class Page { Status = 0, Scan = 1, Reports = 2 };
+enum class Page { Status = 0, Scan = 1, Reports = 2, Quarantine = 3 };
 
 class MainWindow {
 public:
@@ -64,10 +69,16 @@ private:
     void ShowPage(Page page);
     void SetBusy(bool busy, const std::wstring& pending);
 
+    void UpdateMetrics();
+
     void OnCommand(int id);
     void OnDrawItem(const DRAWITEMSTRUCT& item);
     LRESULT OnNotify(const NMHDR& header);
     void OnLeftButtonDown(int x, int y);
+
+    void PaintQuarantinePage(HDC dc);
+    void SetQuarantineFromThreats();
+    void QuarantineAction(int command);
 
     void OpenOptions();
     void ShowAbout();
@@ -104,6 +115,17 @@ private:
     std::vector<ThreatRecord> threats_;
     std::wstring threatsError_;
 
+    int clientWidth_ = 0;
+    int clientHeight_ = 0;
+    int panelRight_ = 0;
+    int panelBottom_ = 0;
+    int pageRight_ = 0;
+    int group2Bottom_ = 0;
+    int detailsLeft_ = 0;
+
+    std::shared_ptr<ProgressTracker> tracker_;
+    std::unique_ptr<ui::ProgressWindow> progress_;
+
     Page page_ = Page::Status;
     int selectedRow_ = 0;
     std::wstring operationText_;
@@ -116,8 +138,11 @@ private:
     HFONT fontBrand_ = nullptr;
     HFONT fontSmall_ = nullptr;
 
+    std::vector<ThreatRecord> quarantineRecords_;
     std::unique_ptr<ReportsView> reports_;
-    HWND navButtons_[3] = {nullptr, nullptr, nullptr};
+    std::unique_ptr<ReportsView> quarantine_;
+    HWND navButtons_[4] = {nullptr, nullptr, nullptr, nullptr};
     HWND toolButtons_[3] = {nullptr, nullptr, nullptr};
     HWND scanButtons_[3] = {nullptr, nullptr, nullptr};
+    HWND quarantineButtons_[4] = {nullptr, nullptr, nullptr, nullptr};
 };

@@ -19,6 +19,7 @@
 #define IDC_NAV_STATUS 1101
 #define IDC_NAV_SCAN 1102
 #define IDC_NAV_REPORTS 1103
+#define IDC_NAV_QUARANTINE 1104
 
 // Per-tab controls.
 #define IDC_SCAN_QUICK 1201
@@ -26,6 +27,11 @@
 #define IDC_SCAN_CUSTOM 1203
 #define IDC_REPORTS_LIST 1211
 #define IDC_REPORTS_REFRESH 1212
+#define IDC_QUAR_LIST 1221
+#define IDC_QUAR_REMOVE 1222
+#define IDC_QUAR_RESTORE 1223
+#define IDC_QUAR_EXCLUDE 1224
+#define IDC_QUAR_REANALYZE 1225
 
 // Options dialog template and controls.
 #define IDD_OPTIONS 2000

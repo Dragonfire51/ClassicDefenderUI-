@@ -1,8 +1,9 @@
 # ClassicDefenderUI — agent notes
 
 Win32 (C++17, GDI, no UWP and no .NET) front-end for the Microsoft Defender WMI
-provider, drawn to look like Norton AntiVirus 2002. Fixed 660x452 window,
-owner-draw navigation, live-switchable colour themes.
+provider, drawn to look like Norton AntiVirus 2002. Resizable/maximizable window
+whose 2002 layout reflows from a 660x452 design size, owner-draw navigation,
+live-switchable colour themes.
 
 ## Build
 
@@ -34,7 +35,10 @@ for layout work and screenshots.
 | `src/ui/Paint.*` | GDI primitives in 96 dpi logical units |
 | `src/ui/MainWindow.*` | Window, pages, async plumbing, owner-draw buttons |
 | `src/ui/OptionsDialog.*` | Modal options: presets, `ChooseColorW`, exclusions, protection toggles |
-| `src/ui/ReportsView.*` | `SysListView32` with themed custom draw |
+| `src/ui/ReportsView.*` | `SysListView32` with themed custom draw (Reports and Quarantine) |
+| `src/ui/ProgressWindow.*` | Themed modeless progress window for scans and updates |
+| `src/Progress.h` | Thread-safe `ProgressSnapshot` shared by the workers and the window |
+| `src/ScanScope.*` | Scan scope walk (files), services, process and startup counters, definition folder size |
 | `src/ui/FolderPicker.*` | `IFileOpenDialog` folder picker |
 | `src/Async.h` | `PostAsync<Result>()`: worker → heap payload → `WM_APP_*` |
 

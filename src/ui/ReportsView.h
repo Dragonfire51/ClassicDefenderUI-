@@ -18,6 +18,7 @@ public:
 
     void Layout(const RECT& deviceRect);
     void SetThreats(const std::vector<ThreatRecord>& threats);
+    int Selected() const;
     void ApplyTheme(const AppTheme& theme);
 
     // Handles NM_CUSTOMDRAW coming from the list view and returns the CDRF_* code.

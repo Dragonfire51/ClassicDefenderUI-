@@ -38,6 +38,10 @@ void DrawGroupBox(HDC dc, const RECT& rc, const std::wstring& title, const AppTh
 void DrawFeatureRow(HDC dc, const RECT& rc, const std::wstring& label, const std::wstring& value, bool ok,
                     bool selected, const AppTheme& theme, HFONT normal, HFONT bold);
 
+// Classic sunken bar with moving stripes. percent < 0 runs indeterminate, with
+// marqueePhase driving the stripe offset.
+void DrawProgressBar(HDC dc, const RECT& rc, int percent, int marqueePhase, const AppTheme& theme);
+
 // Bevel button used by the scan page and the toolbar glyphs.
 void DrawClassicButton(HDC dc, const RECT& rc, const std::wstring& text, const AppTheme& theme, HFONT font,
                        bool pressed, bool focused, bool defaultButton = false);

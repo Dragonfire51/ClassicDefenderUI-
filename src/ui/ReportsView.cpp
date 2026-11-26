@@ -95,6 +95,11 @@ void ReportsView::SetThreats(const std::vector<ThreatRecord>& threats) {
     InvalidateRect(list_, nullptr, TRUE);
 }
 
+int ReportsView::Selected() const {
+    if (!list_) return -1;
+    return ListView_GetNextItem(list_, -1, LVNI_SELECTED);
+}
+
 void ReportsView::ApplyTheme(const AppTheme& theme) {
     theme_ = theme;
     if (!list_) return;
