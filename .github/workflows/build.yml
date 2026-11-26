@@ -36,8 +36,10 @@ jobs:
           $exe = "build\Release\ClassicDefenderUI.exe"
           $info = (Get-Item $exe).VersionInfo
           $info | Format-List FileVersion, ProductVersion, ProductName, FileDescription
-          $expected = ((Select-String -Path CMakeLists.txt -Pattern 'project\(ClassicDefenderUI VERSION ([0-9.]+)').Matches[0].Groups[1].Value) + ".0"
-          if ($info.FileVersion -ne $expected) { throw "FileVersion $($info.FileVersion) != $expected" }
+          $expected = (Select-String -Path CMakeLists.txt -Pattern 'project\(ClassicDefenderUI VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          if ($info.FileVersion -ne $expected) { throw "FileVersion string '$($info.FileVersion)' != '$expected'" }
+          $numeric = "$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart)"
+          if ($numeric -ne $expected) { throw "VS_FIXEDFILEINFO '$numeric' != '$expected'" }
 
       - name: Upload the executable
         uses: actions/upload-artifact@v4
