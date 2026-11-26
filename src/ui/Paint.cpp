@@ -288,3 +288,62 @@ void DrawToolbarButton(HDC dc, const RECT& rc, ToolGlyph glyph, const std::wstri
 }
 
 }  // namespace ui
+
+namespace ui {
+namespace {
+
+RECT RectOf(int left, int top, int right, int bottom) {
+    RECT rc = {left, top, right, bottom};
+    return rc;
+}
+
+}  // namespace
+
+void DrawProgressBar(HDC dc, const RECT& rc, int percent, int marqueePhase, const AppTheme& theme) {
+    const RECT inner = Deflate(rc, 1);
+
+    FillSolid(dc, rc, theme.border);
+    FillSolid(dc, inner, Blend(theme.contentBg, RGB(0, 0, 0), 8));
+    LineH(dc, inner.left, inner.right, inner.top, Blend(theme.contentBg, RGB(0, 0, 0), 22));
+    LineV(dc, inner.left, inner.top, inner.bottom, Blend(theme.contentBg, RGB(0, 0, 0), 22));
+
+    const int left = inner.left + 1;
+    const int right = inner.right - 1;
+    const int top = inner.top + 1;
+    const int bottom = inner.bottom - 1;
+    if (right <= left) return;
+
+    const int fillRight = percent < 0 ? right : left + MulDiv(right - left, std::clamp(percent, 0, 100), 100);
+    const COLORREF face = theme.brandPrimary;
+    const COLORREF lightFace = Blend(face, RGB(255, 255, 255), 35);
+    const COLORREF shade = Blend(face, RGB(0, 0, 0), 28);
+
+    if (fillRight > left) {
+        const int middle = top + (bottom - top) / 2;
+        FillSolid(dc, RectOf(left, top, fillRight, middle), lightFace);
+        FillSolid(dc, RectOf(left, middle, fillRight, bottom), face);
+        // Segment grooves, the detail that gives the bar its period look.
+        for (int x = left + 9; x < fillRight; x += 9) LineV(dc, x, top, bottom, shade);
+    }
+
+    if (percent < 0) {
+        const int span = std::max(1, bottom - top);
+        const int step = 18;
+        const int offset = (marqueePhase * 2) % step;
+        const COLORREF stripe = Blend(theme.brandPrimary, theme.contentBg, 55);
+        HBRUSH brush = CreateSolidBrush(stripe);
+        HPEN pen = CreatePen(PS_SOLID, 1, stripe);
+        HGDIOBJ oldBrush = SelectObject(dc, brush);
+        HGDIOBJ oldPen = SelectObject(dc, pen);
+        for (int x = left + offset - step; x < right; x += step) {
+            POINT points[3] = {{x, top}, {x + span / 2, top + span / 2}, {x, bottom}};
+            Polygon(dc, points, 3);
+        }
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBrush);
+        DeleteObject(pen);
+        DeleteObject(brush);
+    }
+}
+
+}  // namespace ui

@@ -68,6 +68,11 @@ public:
     bool StartScan(long scanType, const std::wstring& path = std::wstring());
     bool UpdateSignatures();
 
+    // Quarantine actions. The provider exposes no method for them, so these
+    // drive the engine's own MpCmdRun.exe (-Restore / -Remove).
+    bool RestoreThreat(const std::wstring& threatName);
+    bool RemoveThreat(const std::wstring& threatName);
+
     bool AddExclusion(const std::wstring& path);
     bool RemoveExclusion(const std::wstring& path);
 

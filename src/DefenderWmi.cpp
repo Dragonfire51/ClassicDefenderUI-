@@ -269,6 +269,66 @@ std::wstring SeverityName(int severityId) {
     }
 }
 
+
+namespace {
+
+std::wstring EnvValue(const wchar_t* name) {
+    wchar_t buffer[MAX_PATH * 2] = {};
+    const DWORD length = GetEnvironmentVariableW(name, buffer, static_cast<DWORD>(std::size(buffer)));
+    if (length == 0 || length >= std::size(buffer)) return std::wstring();
+    return std::wstring(buffer, length);
+}
+
+// MpCmdRun lives in the newest versioned Platform folder; the legacy location is
+// only a fallback for old builds.
+std::wstring FindMpCmdRun() {
+    const std::wstring programData = EnvValue(L"ProgramData");
+    if (!programData.empty()) {
+        const std::wstring platform = programData + L"\\Microsoft\\Windows Defender\\Platform";
+        WIN32_FIND_DATAW data = {};
+        HANDLE search = FindFirstFileW((platform + L"\\*").c_str(), &data);
+        if (search != INVALID_HANDLE_VALUE) {
+            std::wstring newest;
+            do {
+                if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+                const std::wstring name = data.cFileName;
+                if (name == L"." || name == L"..") continue;
+                const std::wstring candidate = platform + L"\\" + name + L"\\MpCmdRun.exe";
+                if (GetFileAttributesW(candidate.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+                if (newest.empty() || wcscmp(name.c_str(), newest.c_str()) > 0) newest = name;
+            } while (FindNextFileW(search, &data));
+            FindClose(search);
+            if (!newest.empty()) return platform + L"\\" + newest + L"\\MpCmdRun.exe";
+        }
+    }
+
+    const std::wstring programFiles = EnvValue(L"ProgramFiles");
+    if (!programFiles.empty()) {
+        const std::wstring legacy = programFiles + L"\\Windows Defender\\MpCmdRun.exe";
+        if (GetFileAttributesW(legacy.c_str()) != INVALID_FILE_ATTRIBUTES) return legacy;
+    }
+    return std::wstring();
+}
+
+bool RunAndWait(const std::wstring& exe, const std::wstring& args, DWORD& exitCode) {
+    exitCode = 1;
+    if (exe.empty()) return false;
+    std::wstring commandLine = L"\"" + exe + L"\" " + args;
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process = {};
+    if (!CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                        &startup, &process))
+        return false;
+    WaitForSingleObject(process.hProcess, 180000);
+    GetExitCodeProcess(process.hProcess, &exitCode);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
+}
+
+}  // namespace
+
 std::wstring ThreatStatusName(int statusId) {
     switch (statusId) {
         case 1:
@@ -673,6 +733,39 @@ bool DefenderClient::Impl::ModifyPathList(const wchar_t* method, const std::wstr
     VariantClear(&value);
     if (FAILED(putHr)) return false;
     return SUCCEEDED(service->PutInstance(instance.get(), WBEM_FLAG_UPDATE_ONLY, nullptr, nullptr));
+}
+
+
+bool DefenderClient::RestoreThreat(const std::wstring& threatName) {
+    DWORD exitCode = 1;
+    const std::wstring exe = FindMpCmdRun();
+    if (!RunAndWait(exe, L"-Restore -Name \"" + threatName + L"\"", exitCode)) {
+        impl_->lastError = L"MpCmdRun.exe could not be started; quarantine actions need the Defender platform "
+                           L"folder.";
+        return false;
+    }
+    if (exitCode != 0) {
+        impl_->lastError = L"MpCmdRun -Restore returned " + std::to_wstring(exitCode) +
+                           L". Tamper Protection blocks quarantine changes, and the item must still exist.";
+        return false;
+    }
+    return true;
+}
+
+bool DefenderClient::RemoveThreat(const std::wstring& threatName) {
+    DWORD exitCode = 1;
+    const std::wstring exe = FindMpCmdRun();
+    if (!RunAndWait(exe, L"-Remove -Name \"" + threatName + L"\"", exitCode)) {
+        impl_->lastError = L"MpCmdRun.exe could not be started; quarantine actions need the Defender platform "
+                           L"folder.";
+        return false;
+    }
+    if (exitCode != 0) {
+        impl_->lastError = L"MpCmdRun -Remove returned " + std::to_wstring(exitCode) +
+                           L". Tamper Protection blocks quarantine changes.";
+        return false;
+    }
+    return true;
 }
 
 bool DefenderClient::AddExclusion(const std::wstring& path) {

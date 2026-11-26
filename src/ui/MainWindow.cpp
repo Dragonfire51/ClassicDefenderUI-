@@ -6,37 +6,44 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
+#include <thread>
 
 #include "../Async.h"
+#include "../Progress.h"
 #include "../Resource.h"
+#include "../ScanScope.h"
 #include "Version.h"
 #include "FolderPicker.h"
 #include "OptionsDialog.h"
 #include "Paint.h"
+#include "ProgressWindow.h"
 #include "ReportsView.h"
 
 namespace {
 
-// The 2002 layout is designed on a fixed 660x452 client area. Painting goes
-// through an anisotropic mapping, child controls use ui::Scale().
-constexpr int kClientWidth = 660;
-constexpr int kClientHeight = 452;
+// The 2002 layout is designed on a 660x452 client area. The window is resizable
+// now, so the parts that can grow (panel, page width, second group box, details
+// column) are computed from the client size in UpdateMetrics(); everything else
+// keeps its design value, which is why the 660x452 rendering is unchanged.
+constexpr int kMinWidth = 660;
+constexpr int kMinHeight = 452;
 constexpr int kHeaderHeight = 58;
 constexpr int kSidebarWidth = 178;
 constexpr int kPanelLeft = 190;
 constexpr int kPanelTop = 64;
-constexpr int kPanelRight = 648;
-constexpr int kPanelBottom = 400;
+constexpr int kPanelRightBase = 648;
+constexpr int kPanelBottomBase = 400;
 constexpr int kPageLeft = kPanelLeft + 16;
-constexpr int kPageRight = kPanelRight - 12;
+constexpr int kPageRightBase = kPanelRightBase - 12;
 constexpr int kTitleTop = 74;
 constexpr int kRowHeight = 27;
 constexpr int kGroup1Top = 112;
 constexpr int kGroup1Bottom = 243;
 constexpr int kGroup2Top = 254;
-constexpr int kGroup2Bottom = 360;
-constexpr int kDetailsLeft = 506;
+constexpr int kGroup2BottomBase = 360;
+constexpr int kDetailsWidth = 130;
 constexpr int kNavTop = 108;
 constexpr int kNavHeight = 28;
 constexpr int kNavStep = 32;
@@ -56,6 +63,220 @@ std::wstring WindowText(HWND control) {
     GetWindowTextW(control, text.data(), length + 1);
     text.resize(static_cast<size_t>(length));
     return text;
+}
+
+void PostOperationDone(HWND target, const std::wstring& message, bool success) {
+    auto* result = new OperationResult();
+    result->message = message;
+    result->success = success;
+    if (!PostMessageW(target, WM_APP_OPERATION_DONE, 0, reinterpret_cast<LPARAM>(result))) delete result;
+}
+
+std::wstring FormatMegabytes(long long bytes) {
+    wchar_t buffer[64] = {};
+    swprintf(buffer, 64, L"%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+    return buffer;
+}
+
+// Runs one scan: the engine call on its own thread, the scope walk on this one.
+// Defender exposes no per-file progress, so the counters come from the walk and
+// from live polls of the process list; the engine only says when it is done.
+void RunScanWorker(HWND target, std::shared_ptr<ProgressTracker> tracker, long scanType, std::wstring path,
+                   bool demo) {
+    ComApartment apartment;
+
+    const scope::EnvironmentCounts environment = scope::CountEnvironment();
+    tracker->Update([&](ProgressSnapshot& s) {
+        s.phase = ProgressPhase::Running;
+        s.systemItems = environment.services;
+        s.startupItems = environment.startup;
+        s.memoryItems = environment.processes;
+        s.current = L"Enumerating the scan scope...";
+    });
+
+    if (demo) {
+        const long long total = scanType == 2 ? 184320 : (scanType == 1 ? 21475 : 5120);
+        tracker->Update([&](ProgressSnapshot& s) { s.filesTotal = total; });
+        const long long stepSize = std::max<long long>(1, total / 100);
+        for (long long done = 0; done <= total; done += stepSize) {
+            const long long value = std::min(done, total);
+            tracker->Update([&](ProgressSnapshot& s) {
+                s.filesChecked = value;
+                s.percent = static_cast<int>(value * 100 / total);
+                s.memoryItems = environment.processes;
+                s.threats = value > total / 2 ? 1 : 0;
+                s.current = L"C:\\Windows\\System32\\drivers\\file" + std::to_wstring(value % 249) + L".sys";
+            });
+            Sleep(22);
+        }
+        tracker->Update([&](ProgressSnapshot& s) {
+            s.phase = ProgressPhase::Done;
+            s.percent = 100;
+            s.current.clear();
+            s.message = L"Scan complete. No threats were found (demo mode).";
+        });
+        PostOperationDone(target, L"Scan finished - no threats found (demo mode).", true);
+        return;
+    }
+
+    DefenderClient client;
+    std::atomic<bool> engineDone{false};
+    std::atomic<bool> engineOk{false};
+    std::wstring engineError;
+    std::thread engine([&]() {
+        ComApartment engineApartment;
+        DefenderClient engineClient;
+        engineOk = engineClient.StartScan(scanType, path);
+        if (!engineOk) engineError = engineClient.LastError();
+        engineDone = true;
+    });
+
+    if (scanType == 3) {
+        const long long total = scope::CountFiles(path, [&] { return engineDone.load(); });
+        tracker->Update([&](ProgressSnapshot& s) { s.filesTotal = total; });
+    }
+
+    const std::vector<std::wstring> roots = scope::Roots(scanType, path);
+    long long sinceMemoryPoll = 0;
+    const scope::WalkResult walked =
+        scope::Walk(roots,
+                    [&](const std::wstring& current, const scope::WalkResult& result) {
+                        if (++sinceMemoryPoll % 256 == 0) {
+                            const long long processes = scope::CountProcesses();
+                            tracker->Update([&](ProgressSnapshot& s) {
+                                s.filesChecked = result.files;
+                                s.memoryItems = processes;
+                                s.current = current;
+                                if (s.filesTotal > 0)
+                                    s.percent = static_cast<int>(std::min(100LL, result.files * 100 / s.filesTotal));
+                            });
+                        }
+                        return !engineDone.load();
+                    },
+                    [&] { return engineDone.load(); });
+
+    tracker->Update([&](ProgressSnapshot& s) {
+        s.filesChecked = walked.files;
+        s.current = L"Scope walked. Waiting for the engine to finish...";
+        s.phase = ProgressPhase::Finishing;
+    });
+
+    engine.join();
+
+    if (engineOk.load()) {
+        tracker->Update([&](ProgressSnapshot& s) {
+            s.phase = ProgressPhase::Done;
+            s.percent = 100;
+            s.current.clear();
+            s.message = L"Scan complete. Defender finished the scan without reporting an outstanding threat.";
+        });
+        PostOperationDone(target, L"Scan finished - the Defender engine completed the scan.", true);
+    } else {
+        tracker->Update([&](ProgressSnapshot& s) {
+            s.phase = ProgressPhase::Failed;
+            s.message = L"Scan failed: " + engineError;
+        });
+        PostOperationDone(target, L"Scan failed - " + engineError, false);
+    }
+}
+
+// Runs a definition update and derives the transfer rate from the growth of the
+// Defender definition folder, which is the only size signal the provider gives.
+void RunUpdateWorker(HWND target, std::shared_ptr<ProgressTracker> tracker, bool demo) {
+    ComApartment apartment;
+
+    if (demo) {
+        long long bytes = 0;
+        for (int step = 0; step <= 40; ++step) {
+            bytes += 186000;
+            tracker->Update([&](ProgressSnapshot& s) {
+                s.phase = ProgressPhase::Running;
+                s.bytes = bytes;
+                s.bytesPerSecond = 1.6 * 1024 * 1024;
+                s.signatures = L"1.403.2195.0";
+                s.subtitle = L"Downloading definitions from Microsoft Update";
+                s.current = L"mpavbase.vdm";
+            });
+            Sleep(90);
+        }
+        tracker->Update([&](ProgressSnapshot& s) {
+            s.phase = ProgressPhase::Done;
+            s.signatures = L"1.405.1002.0";
+            s.message = L"Definitions updated to 1.405.1002.0 (demo mode).";
+        });
+        PostOperationDone(target, L"Virus definitions updated (demo mode).", true);
+        return;
+    }
+
+    DefenderClient client;
+    DefenderStatus before;
+    client.QueryStatus(before);
+
+    const long long startBytes = scope::DefinitionBytes();
+    std::atomic<bool> engineDone{false};
+    std::atomic<bool> engineOk{false};
+    std::wstring engineError;
+    std::thread engine([&]() {
+        ComApartment engineApartment;
+        DefenderClient engineClient;
+        engineOk = engineClient.UpdateSignatures();
+        if (!engineOk) engineError = engineClient.LastError();
+        engineDone = true;
+    });
+
+    double speed = 0.0;
+    long long previousBytes = startBytes;
+    ULONGLONG previousTick = GetTickCount64();
+    while (!engineDone.load()) {
+        Sleep(400);
+        const long long current = scope::DefinitionBytes();
+        const ULONGLONG now = GetTickCount64();
+        const double seconds = static_cast<double>(now - previousTick) / 1000.0;
+        if (seconds > 0.2) {
+            if (current > previousBytes) {
+                const double instant = static_cast<double>(current - previousBytes) / seconds;
+                speed = speed <= 0.0 ? instant : speed * 0.6 + instant * 0.4;
+            } else {
+                speed *= 0.7;
+            }
+        }
+        previousBytes = current;
+        previousTick = now;
+
+        const long long delta = std::max(0LL, current - startBytes);
+        tracker->Update([&](ProgressSnapshot& s) {
+            s.phase = ProgressPhase::Running;
+            s.bytes = delta;
+            s.bytesPerSecond = speed;
+            s.signatures = before.signatureVersion;
+            s.subtitle = delta > 0 ? L"Downloading definitions from Microsoft Update"
+                                   : L"Contacting Microsoft Update...";
+            s.current = delta > 0 ? L"Definition folder grew by " + FormatMegabytes(delta) : L"No transfer yet";
+        });
+    }
+    engine.join();
+
+    DefenderStatus after;
+    client.QueryStatus(after);
+    const bool changed = !after.signatureVersion.empty() && after.signatureVersion != before.signatureVersion;
+
+    if (engineOk.load()) {
+        tracker->Update([&](ProgressSnapshot& s) {
+            s.phase = ProgressPhase::Done;
+            s.signatures = after.signatureVersion;
+            s.message = changed ? L"Definitions updated to " + after.signatureVersion
+                                : L"Definitions are already up to date (" + after.signatureVersion + L").";
+        });
+        PostOperationDone(target, changed ? L"Virus definitions updated to " + after.signatureVersion
+                                          : L"Virus definitions are up to date.",
+                          true);
+    } else {
+        tracker->Update([&](ProgressSnapshot& s) {
+            s.phase = ProgressPhase::Failed;
+            s.message = L"Update failed: " + engineError;
+        });
+        PostOperationDone(target, L"Update failed - " + engineError, false);
+    }
 }
 
 DefenderStatus DemoStatus() {
@@ -165,8 +386,9 @@ bool MainWindow::Create(HINSTANCE instance, const AppSettings& settings, bool de
         threats_ = DemoThreats();
     }
 
-    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    RECT frame = {0, 0, ui::Scale(kClientWidth), ui::Scale(kClientHeight)};
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX |
+                      WS_MAXIMIZEBOX | WS_CLIPCHILDREN;
+    RECT frame = {0, 0, ui::Scale(kMinWidth), ui::Scale(kMinHeight)};
     AdjustWindowRect(&frame, style, FALSE);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -199,14 +421,14 @@ const AppTheme& MainWindow::Theme() const {
 }
 
 RECT MainWindow::PanelRect() const {
-    return MakeRect(kPanelLeft, kPanelTop, kPanelRight, kPanelBottom);
+    return MakeRect(kPanelLeft, kPanelTop, panelRight_, panelBottom_);
 }
 
 RECT MainWindow::RowRect(int index) const {
     const int column = index < 4 ? index : index - 4;
     const int top = (index < 4 ? kGroup1Top : kGroup2Top) + 21;
     const int left = kPageLeft + 1;
-    const int right = kDetailsLeft - 16;
+    const int right = detailsLeft_ - 16;
     return MakeRect(left, top + column * kRowHeight, right, top + (column + 1) * kRowHeight);
 }
 
@@ -236,11 +458,19 @@ LRESULT MainWindow::WndProc(UINT message, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONDOWN: {
             RECT client = {};
             GetClientRect(hwnd_, &client);
-            const int logicalX = MulDiv(GET_X_LPARAM(lParam), kClientWidth, std::max(1L, client.right));
-            const int logicalY = MulDiv(GET_Y_LPARAM(lParam), kClientHeight, std::max(1L, client.bottom));
+            const int logicalX = MulDiv(GET_X_LPARAM(lParam), clientWidth_, std::max<int>(1, client.right));
+            const int logicalY = MulDiv(GET_Y_LPARAM(lParam), clientHeight_, std::max<int>(1, client.bottom));
             OnLeftButtonDown(logicalX, logicalY);
             return 0;
         }
+
+        case WM_SIZE:
+            if (wParam != SIZE_MINIMIZED) {
+                UpdateMetrics();
+                LayoutControls();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return 0;
 
         case WM_TIMER:
             if (!demo_ && !busy_) {
@@ -250,12 +480,15 @@ LRESULT MainWindow::WndProc(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_GETMINMAXINFO: {
+            // Only a lower bound: the window is resizable and maximizable now.
             auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
-            RECT frame = {0, 0, ui::Scale(kClientWidth), ui::Scale(kClientHeight)};
-            AdjustWindowRect(&frame, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
+            RECT frame = {0, 0, ui::Scale(kMinWidth), ui::Scale(kMinHeight)};
+            AdjustWindowRect(&frame,
+                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX |
+                                 WS_MAXIMIZEBOX,
+                             FALSE);
             info->ptMinTrackSize.x = frame.right - frame.left;
             info->ptMinTrackSize.y = frame.bottom - frame.top;
-            info->ptMaxTrackSize = info->ptMinTrackSize;
             return 0;
         }
 
@@ -272,6 +505,7 @@ LRESULT MainWindow::WndProc(UINT message, WPARAM wParam, LPARAM lParam) {
             threats_ = std::move(result->threats);
             threatsError_ = result->error;
             if (reports_) reports_->SetThreats(threats_);
+            SetQuarantineFromThreats();
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         }
@@ -282,7 +516,7 @@ LRESULT MainWindow::WndProc(UINT message, WPARAM wParam, LPARAM lParam) {
             operationText_ = result->message;
             operationFailed_ = !result->success;
             RefreshStatus();
-            if (page_ == Page::Reports) RefreshThreats();
+            if (page_ == Page::Reports || page_ == Page::Quarantine) RefreshThreats();
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         }
@@ -319,6 +553,27 @@ LRESULT MainWindow::WndProc(UINT message, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hwnd_, message, wParam, lParam);
 }
 
+void MainWindow::UpdateMetrics() {
+    RECT client = {};
+    if (hwnd_) GetClientRect(hwnd_, &client);
+
+    const int dpi = std::max(96, ui::Dpi());
+    const int logicalWidth = client.right > 0 ? MulDiv(client.right, 96, dpi) : kMinWidth;
+    const int logicalHeight = client.bottom > 0 ? MulDiv(client.bottom, 96, dpi) : kMinHeight;
+
+    clientWidth_ = std::max(kMinWidth, logicalWidth);
+    clientHeight_ = std::max(kMinHeight, logicalHeight);
+
+    const int extraWidth = clientWidth_ - kMinWidth;
+    const int extraHeight = clientHeight_ - kMinHeight;
+
+    panelRight_ = kPanelRightBase + extraWidth;
+    panelBottom_ = kPanelBottomBase + extraHeight;
+    pageRight_ = kPageRightBase + extraWidth;
+    detailsLeft_ = pageRight_ - kDetailsWidth;
+    group2Bottom_ = kGroup2BottomBase + extraHeight;
+}
+
 bool MainWindow::OnCreate() {
     fontNormal_ = ui::CreateUiFont(-11, FW_NORMAL, false, L"Tahoma");
     fontBold_ = ui::CreateUiFont(-11, FW_BOLD, false, L"Tahoma");
@@ -326,15 +581,17 @@ bool MainWindow::OnCreate() {
     fontBrand_ = ui::CreateUiFont(-19, FW_BOLD, true, L"Arial");
     fontSmall_ = ui::CreateUiFont(-10, FW_NORMAL, false, L"Tahoma");
 
+    UpdateMetrics();
     CreateControls();
     LayoutControls();
     ApplyThemeToChildren();
 
     SetTimer(hwnd_, 1, 30000, nullptr);
 
-    ShowPage(static_cast<Page>(std::clamp(settings_.lastTab, 0, 2)));
+    ShowPage(static_cast<Page>(std::clamp(settings_.lastTab, 0, 3)));
     if (demo_) {
         if (reports_) reports_->SetThreats(threats_);
+        SetQuarantineFromThreats();
     } else {
         RefreshStatus();
     }
@@ -345,9 +602,9 @@ void MainWindow::CreateControls() {
     const DWORD navStyle = WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP;
     const auto id = [](int value) { return reinterpret_cast<HMENU>(static_cast<INT_PTR>(value)); };
 
-    const wchar_t* navLabels[3] = {L"Status", L"Scan for Viruses", L"Reports"};
-    const int navIds[3] = {IDC_NAV_STATUS, IDC_NAV_SCAN, IDC_NAV_REPORTS};
-    for (int index = 0; index < 3; ++index)
+    const wchar_t* navLabels[4] = {L"Status", L"Scan for Viruses", L"Reports", L"Quarantine"};
+    const int navIds[4] = {IDC_NAV_STATUS, IDC_NAV_SCAN, IDC_NAV_REPORTS, IDC_NAV_QUARANTINE};
+    for (int index = 0; index < 4; ++index)
         navButtons_[index] = CreateWindowExW(0, L"BUTTON", navLabels[index], navStyle, 0, 0, 0, 0, hwnd_,
                                              id(navIds[index]), instance_, nullptr);
 
@@ -363,8 +620,16 @@ void MainWindow::CreateControls() {
         scanButtons_[index] = CreateWindowExW(0, L"BUTTON", scanLabels[index], navStyle, 0, 0, 0, 0, hwnd_,
                                               id(scanIds[index]), instance_, nullptr);
 
+    const wchar_t* quarantineLabels[4] = {L"Delete", L"Restore", L"Exclude", L"Reanalyze"};
+    const int quarantineIds[4] = {IDC_QUAR_REMOVE, IDC_QUAR_RESTORE, IDC_QUAR_EXCLUDE, IDC_QUAR_REANALYZE};
+    for (int index = 0; index < 4; ++index)
+        quarantineButtons_[index] = CreateWindowExW(0, L"BUTTON", quarantineLabels[index], navStyle, 0, 0, 0, 0,
+                                                    hwnd_, id(quarantineIds[index]), instance_, nullptr);
+
     reports_ = std::make_unique<ReportsView>();
     reports_->Create(hwnd_, instance_);
+    quarantine_ = std::make_unique<ReportsView>();
+    quarantine_->Create(hwnd_, instance_);
 }
 
 void MainWindow::LayoutControls() {
@@ -372,7 +637,7 @@ void MainWindow::LayoutControls() {
         if (control) MoveWindow(control, ui::Scale(x), ui::Scale(y), ui::Scale(width), ui::Scale(height), TRUE);
     };
 
-    for (int index = 0; index < 3; ++index) place(navButtons_[index], 8, kNavTop + index * kNavStep, 166, kNavHeight);
+    for (int index = 0; index < 4; ++index) place(navButtons_[index], 8, kNavTop + index * kNavStep, 166, kNavHeight);
 
     place(toolButtons_[0], 250, 6, 86, 46);
     place(toolButtons_[1], 342, 6, 80, 46);
@@ -383,21 +648,39 @@ void MainWindow::LayoutControls() {
     place(scanButtons_[2], kPageLeft, 216, 260, 34);
 
     if (reports_) {
-        RECT list = MakeRect(ui::Scale(kPageLeft), ui::Scale(124), ui::Scale(kPageRight), ui::Scale(348));
+        RECT list = MakeRect(ui::Scale(kPageLeft), ui::Scale(124), ui::Scale(pageRight_),
+                             ui::Scale(348 + (clientHeight_ - kMinHeight)));
         reports_->Layout(list);
-        place(reports_->RefreshButton(), kPageRight - 80, 70, 80, 24);
+        place(reports_->RefreshButton(), pageRight_ - 80, 70, 80, 24);
+    }
+
+    if (quarantine_) {
+        const int listBottom = panelBottom_ - 100;
+        RECT list = MakeRect(ui::Scale(kPageLeft), ui::Scale(124), ui::Scale(pageRight_), ui::Scale(listBottom));
+        quarantine_->Layout(list);
+        const int top = listBottom + 12;  // 28 px tall, ends 60 px above the panel bottom
+        const int widths[4] = {96, 96, 96, 112};
+        int left = kPageLeft;
+        for (int index = 0; index < 4; ++index) {
+            place(quarantineButtons_[index], left, top, widths[index], 28);
+            left += widths[index] + 6;
+        }
     }
 }
 
 void MainWindow::ApplyThemeToChildren() {
     const AppTheme& theme = Theme();
     if (reports_) reports_->ApplyTheme(theme);
+    if (quarantine_) quarantine_->ApplyTheme(theme);
+    if (progress_) progress_->ApplyTheme(theme);
 
     for (HWND button : navButtons_)
         if (button) InvalidateRect(button, nullptr, TRUE);
     for (HWND button : toolButtons_)
         if (button) InvalidateRect(button, nullptr, TRUE);
     for (HWND button : scanButtons_)
+        if (button && IsWindowVisible(button)) InvalidateRect(button, nullptr, TRUE);
+    for (HWND button : quarantineButtons_)
         if (button && IsWindowVisible(button)) InvalidateRect(button, nullptr, TRUE);
 
     RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
@@ -426,13 +709,16 @@ void MainWindow::ShowPage(Page page) {
 
     const BOOL scanning = page == Page::Scan;
     const BOOL reporting = page == Page::Reports;
+    const BOOL quarantining = page == Page::Quarantine;
     for (HWND button : scanButtons_) ShowWindow(button, scanning ? SW_SHOW : SW_HIDE);
+    for (HWND button : quarantineButtons_) ShowWindow(button, quarantining ? SW_SHOW : SW_HIDE);
     if (reports_) {
         ShowWindow(reports_->Handle(), reporting ? SW_SHOW : SW_HIDE);
         ShowWindow(reports_->RefreshButton(), reporting ? SW_SHOW : SW_HIDE);
     }
+    if (quarantine_) ShowWindow(quarantine_->Handle(), quarantining ? SW_SHOW : SW_HIDE);
 
-    if (reporting && threats_.empty() && threatsError_.empty() && !demo_) RefreshThreats();
+    if ((reporting || quarantining) && threats_.empty() && threatsError_.empty()) RefreshThreats();
 
     // Owner-draw navigation depends on the active page, so it must repaint too.
     for (HWND button : navButtons_)
@@ -452,6 +738,15 @@ void MainWindow::OnCommand(int id) {
             break;
         case IDC_NAV_REPORTS:
             ShowPage(Page::Reports);
+            break;
+        case IDC_NAV_QUARANTINE:
+            ShowPage(Page::Quarantine);
+            break;
+        case IDC_QUAR_REMOVE:
+        case IDC_QUAR_RESTORE:
+        case IDC_QUAR_EXCLUDE:
+        case IDC_QUAR_REANALYZE:
+            QuarantineAction(id);
             break;
         case IDC_BTN_LIVEUPDATE:
             StartUpdateOperation();
@@ -488,7 +783,7 @@ void MainWindow::OnDrawItem(const DRAWITEMSTRUCT& item) {
     const std::wstring text = WindowText(item.hwndItem);
     const AppTheme& theme = Theme();
 
-    if (id >= IDC_NAV_STATUS && id <= IDC_NAV_REPORTS) {
+    if (id >= IDC_NAV_STATUS && id <= IDC_NAV_QUARANTINE) {
         DrawNavItem(item.hDC, item.rcItem, theme, fontNormal_, fontBold_, text,
                     static_cast<int>(id - IDC_NAV_STATUS) == static_cast<int>(page_));
         return;
@@ -505,6 +800,8 @@ void MainWindow::OnDrawItem(const DRAWITEMSTRUCT& item) {
 LRESULT MainWindow::OnNotify(const NMHDR& header) {
     if (reports_ && header.hwndFrom == reports_->Handle() && header.code == NM_CUSTOMDRAW)
         return reports_->OnCustomDraw(const_cast<NMHDR*>(&header));
+    if (quarantine_ && header.hwndFrom == quarantine_->Handle() && header.code == NM_CUSTOMDRAW)
+        return quarantine_->OnCustomDraw(const_cast<NMHDR*>(&header));
     return 0;
 }
 
@@ -530,6 +827,7 @@ void MainWindow::SetBusy(bool busy, const std::wstring& pending) {
     const BOOL enabled = busy ? FALSE : TRUE;
     for (HWND button : toolButtons_) EnableWindow(button, enabled);
     for (HWND button : scanButtons_) EnableWindow(button, enabled);
+    for (HWND button : quarantineButtons_) EnableWindow(button, enabled);
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -548,37 +846,53 @@ void MainWindow::StartOperation(const std::wstring& pending, std::function<Opera
 }
 
 void MainWindow::StartUpdateOperation() {
-    if (demo_) {
-        StartOperation(L"Updating virus definitions...", [](DefenderClient&) {
-            Sleep(700);
-            return OperationResult{L"Virus definitions are up to date (demo mode).", true};
-        });
-        return;
-    }
+    if (busy_) return;
 
-    StartOperation(L"Updating virus definitions...", [](DefenderClient& client) {
-        if (client.UpdateSignatures())
-            return OperationResult{L"Windows Defender accepted the signature update request.", true};
-        return OperationResult{L"Update failed - " + client.LastError(), false};
+    auto tracker = std::make_shared<ProgressTracker>();
+    tracker->Update([&](ProgressSnapshot& s) {
+        s.kind = ProgressKind::Update;
+        s.phase = ProgressPhase::Preparing;
+        s.title = L"Updating virus definitions";
+        s.subtitle = L"Contacting Microsoft Update...";
+        s.signatures = status_.signatureVersion;
+        s.current = L"Requesting the newest definition package";
     });
+
+    progress_ = std::unique_ptr<ui::ProgressWindow>(new ui::ProgressWindow());
+    if (!progress_->Create(hwnd_, instance_, tracker, Theme())) progress_.reset();
+    tracker_ = tracker;
+
+    SetBusy(true, L"LiveUpdate running - progress is shown in the update window.");
+    const HWND target = hwnd_;
+    const bool demo = demo_;
+    std::thread([target, tracker, demo]() { RunUpdateWorker(target, tracker, demo); }).detach();
 }
 
 void MainWindow::StartScanOperation(long scanType, const std::wstring& path) {
-    const std::wstring pending = scanType == 1   ? L"Starting a quick scan..."
-                                 : scanType == 2 ? L"Starting a full scan..."
-                                                 : L"Starting a custom scan...";
-    if (demo_) {
-        StartOperation(pending, [](DefenderClient&) {
-            Sleep(900);
-            return OperationResult{L"Scan finished - no threats found (demo mode).", true};
-        });
-        return;
-    }
+    if (busy_) return;
 
-    StartOperation(pending, [scanType, path](DefenderClient& client) {
-        if (client.StartScan(scanType, path)) return OperationResult{L"Scan started in the Defender service.", true};
-        return OperationResult{L"Cannot start the scan - " + client.LastError(), false};
+    auto tracker = std::make_shared<ProgressTracker>();
+    const std::wstring subtitle = scanType == 1   ? L"Quick scan - memory, startup items and the folders malware uses"
+                                 : scanType == 2 ? L"Full system scan - every file on every fixed drive"
+                                                 : L"Custom scan - " + path;
+    tracker->Update([&](ProgressSnapshot& s) {
+        s.kind = ProgressKind::Scan;
+        s.phase = ProgressPhase::Preparing;
+        s.title = L"Scanning for viruses";
+        s.subtitle = subtitle;
+        s.current = L"Starting the Defender engine...";
     });
+
+    progress_ = std::unique_ptr<ui::ProgressWindow>(new ui::ProgressWindow());
+    if (!progress_->Create(hwnd_, instance_, tracker, Theme())) progress_.reset();
+    tracker_ = tracker;
+
+    SetBusy(true, L"Scan running - progress is shown in the scan window.");
+    const HWND target = hwnd_;
+    const bool demo = demo_;
+    std::thread([target, tracker, scanType, path, demo]() {
+        RunScanWorker(target, tracker, scanType, path, demo);
+    }).detach();
 }
 
 void MainWindow::StartCustomScan() {
@@ -619,6 +933,7 @@ void MainWindow::RefreshThreats() {
     if (!hwnd_) return;
     if (demo_) {
         if (reports_) reports_->SetThreats(threats_);
+        SetQuarantineFromThreats();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
     }
@@ -677,6 +992,7 @@ void MainWindow::OnPaint() {
     HDC target = BeginPaint(hwnd_, &paint);
     if (!target) return;
 
+    UpdateMetrics();
     RECT client = {};
     GetClientRect(hwnd_, &client);
     const int width = client.right;
@@ -688,7 +1004,7 @@ void MainWindow::OnPaint() {
         HGDIOBJ oldBitmap = SelectObject(memory, bitmap);
 
         SetMapMode(memory, MM_ANISOTROPIC);
-        SetWindowExtEx(memory, kClientWidth, kClientHeight, nullptr);
+        SetWindowExtEx(memory, clientWidth_, clientHeight_, nullptr);
         SetViewportExtEx(memory, width, height, nullptr);
         SetBkMode(memory, TRANSPARENT);
 
@@ -708,7 +1024,7 @@ void MainWindow::OnPaint() {
 void MainWindow::Paint(HDC dc) {
     const AppTheme& theme = Theme();
 
-    ui::FillSolid(dc, MakeRect(0, 0, kClientWidth, kClientHeight), theme.contentBg);
+    ui::FillSolid(dc, MakeRect(0, 0, clientWidth_, clientHeight_), theme.contentBg);
     PaintSidebar(dc);
     PaintSweep(dc);
     PaintHeader(dc);
@@ -724,11 +1040,14 @@ void MainWindow::Paint(HDC dc) {
         case Page::Reports:
             PaintReportsPage(dc);
             break;
+        case Page::Quarantine:
+            PaintQuarantinePage(dc);
+            break;
     }
 
-    if (!operationText_.empty()) {
-        const int top = page_ == Page::Status ? kGroup2Bottom + 6 : kPanelBottom - 34;
-        RECT line = MakeRect(kPageLeft, top, kPageRight, top + 22);
+    if (!operationText_.empty() && page_ != Page::Quarantine) {
+        const int top = page_ == Page::Status ? group2Bottom_ + 6 : panelBottom_ - 34;
+        RECT line = MakeRect(kPageLeft, top, pageRight_, top + 22);
         ui::DrawTextIn(dc, line, operationText_, fontBold_, operationFailed_ ? theme.warnRed : theme.brandPrimary,
                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
@@ -738,10 +1057,10 @@ void MainWindow::Paint(HDC dc) {
 
 void MainWindow::PaintHeader(HDC dc) {
     const AppTheme& theme = Theme();
-    ui::FillSolid(dc, MakeRect(0, 0, kClientWidth, kHeaderHeight), theme.topBarBg);
-    ui::FillSolid(dc, MakeRect(0, 0, kClientWidth, 2), theme.brandPrimary);
-    ui::LineH(dc, 0, kClientWidth, kHeaderHeight - 2, ui::Blend(theme.topBarBg, RGB(255, 255, 255), 70));
-    ui::LineH(dc, 0, kClientWidth, kHeaderHeight - 1, theme.border);
+    ui::FillSolid(dc, MakeRect(0, 0, clientWidth_, kHeaderHeight), theme.topBarBg);
+    ui::FillSolid(dc, MakeRect(0, 0, clientWidth_, 2), theme.brandPrimary);
+    ui::LineH(dc, 0, clientWidth_, kHeaderHeight - 2, ui::Blend(theme.topBarBg, RGB(255, 255, 255), 70));
+    ui::LineH(dc, 0, clientWidth_, kHeaderHeight - 1, theme.border);
 
     const int logoLeft = 14;
     const int logoTop = 12;
@@ -776,8 +1095,8 @@ void MainWindow::PaintHeader(HDC dc) {
 
 void MainWindow::PaintSidebar(HDC dc) {
     const AppTheme& theme = Theme();
-    ui::FillSolid(dc, MakeRect(0, kHeaderHeight, kSidebarWidth, kClientHeight), theme.sidebarBg);
-    ui::LineV(dc, kSidebarWidth, kHeaderHeight, kClientHeight, theme.border);
+    ui::FillSolid(dc, MakeRect(0, kHeaderHeight, kSidebarWidth, clientHeight_), theme.sidebarBg);
+    ui::LineV(dc, kSidebarWidth, kHeaderHeight, clientHeight_, theme.border);
 
     RECT plate = MakeRect(8, 64, kSidebarWidth - 8, 94);
     ui::FillRounded(dc, plate, 3, theme.contentBg, theme.border);
@@ -793,7 +1112,7 @@ void MainWindow::PaintSweep(HDC dc) {
     const AppTheme& theme = Theme();
     const int saved = SaveDC(dc);
 
-    HRGN clip = CreateRectRgn(0, kHeaderHeight + 4, kClientWidth, kClientHeight);
+    HRGN clip = CreateRectRgn(0, kHeaderHeight + 4, clientWidth_, clientHeight_);
     SelectClipRgn(dc, clip);
 
     HBRUSH brush = CreateSolidBrush(theme.sidebarAccent);
@@ -820,8 +1139,8 @@ void MainWindow::PaintFooter(HDC dc) {
     const int widthSecond = ui::MeasureTextWidth(dc, second, fontBrand_);
     const int widthYear = ui::MeasureTextWidth(dc, year, fontBrand_);
 
-    const int rightEdge = kPanelRight - 4;
-    const int top = kClientHeight - 36;
+    const int rightEdge = panelRight_ - 4;
+    const int top = clientHeight_ - 36;
     const int xYear = rightEdge - widthYear;
     const int xSecond = xYear - widthSecond;
     const int xFirst = xSecond - widthFirst;
@@ -840,20 +1159,20 @@ void MainWindow::PaintStatusPage(HDC dc) {
     const bool healthy = status_.wmiConnected && status_.realTimeProtection && status_.antivirusEnabled;
 
     const std::wstring title = healthy ? L"System Status: OK" : L"System Status: Attention Required";
-    RECT titleRect = MakeRect(kPageLeft, kTitleTop, kPageRight, kTitleTop + 26);
+    RECT titleRect = MakeRect(kPageLeft, kTitleTop, pageRight_, kTitleTop + 26);
     ui::DrawTextIn(dc, titleRect, title, fontTitle_, theme.textPrimary, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     const int titleWidth = ui::MeasureTextWidth(dc, title, fontTitle_);
     ui::DrawBadge(dc, kPageLeft + titleWidth + 12, kTitleTop + 4, 20, healthy, theme);
 
     if (!status_.wmiConnected && !statusError_.empty()) {
-        RECT error = MakeRect(kPageLeft, kTitleTop + 28, kPageRight, kTitleTop + 42);
+        RECT error = MakeRect(kPageLeft, kTitleTop + 28, pageRight_, kTitleTop + 42);
         ui::DrawTextIn(dc, error, statusError_, fontSmall_, theme.warnRed,
                        DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
-    const RECT group1 = MakeRect(kPageLeft, kGroup1Top, kDetailsLeft - 16, kGroup1Bottom);
+    const RECT group1 = MakeRect(kPageLeft, kGroup1Top, detailsLeft_ - 16, kGroup1Bottom);
     ui::DrawGroupBox(dc, group1, L"Security Scanning Features", theme, fontBold_, 21);
-    const RECT group2 = MakeRect(kPageLeft, kGroup2Top, kDetailsLeft - 16, kGroup2Bottom);
+    const RECT group2 = MakeRect(kPageLeft, kGroup2Top, detailsLeft_ - 16, group2Bottom_);
     ui::DrawGroupBox(dc, group2, L"Virus Definition Service", theme, fontBold_, 21);
 
     for (int index = 0; index < static_cast<int>(rows.size()); ++index) {
@@ -862,7 +1181,7 @@ void MainWindow::PaintStatusPage(HDC dc) {
                            theme, fontNormal_, fontBold_);
     }
 
-    PaintDetails(dc, MakeRect(kDetailsLeft, kGroup1Top, kPageRight, kGroup2Bottom));
+    PaintDetails(dc, MakeRect(detailsLeft_, kGroup1Top, pageRight_, group2Bottom_));
 }
 
 void MainWindow::PaintDetails(HDC dc, const RECT& rc) {
@@ -895,10 +1214,10 @@ void MainWindow::PaintDetails(HDC dc, const RECT& rc) {
 void MainWindow::PaintScanPage(HDC dc) {
     const AppTheme& theme = Theme();
 
-    RECT titleRect = MakeRect(kPageLeft, kTitleTop, kPageRight, kTitleTop + 26);
+    RECT titleRect = MakeRect(kPageLeft, kTitleTop, pageRight_, kTitleTop + 26);
     ui::DrawTextIn(dc, titleRect, L"Scan for Viruses", fontTitle_, theme.textPrimary,
                    DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    RECT subtitle = MakeRect(kPageLeft, 102, kPageRight, 118);
+    RECT subtitle = MakeRect(kPageLeft, 102, pageRight_, 118);
     ui::DrawTextIn(dc, subtitle, L"Choose how thoroughly the Defender engine should check this computer.",
                    fontSmall_, theme.textMuted, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
@@ -908,33 +1227,147 @@ void MainWindow::PaintScanPage(HDC dc) {
         L"Any folder or drive you pick, scanned with the same engine.",
     };
     for (int index = 0; index < 3; ++index) {
-        RECT note = MakeRect(476, 132 + index * 42, kPageRight, 132 + index * 42 + 34);
+        RECT note = MakeRect(pageRight_ - 160, 132 + index * 42, pageRight_, 132 + index * 42 + 34);
         ui::DrawTextIn(dc, note, descriptions[index], fontSmall_, theme.textMuted, DT_LEFT | DT_TOP | DT_WORDBREAK);
     }
 
     const int infoTop = 268;
-    RECT line1 = MakeRect(kPageLeft, infoTop, kPageRight, infoTop + 16);
+    RECT line1 = MakeRect(kPageLeft, infoTop, pageRight_, infoTop + 16);
     ui::DrawTextIn(dc, line1, L"Last quick scan: " + status_.lastQuickScan, fontNormal_, theme.textPrimary,
                    DT_LEFT | DT_SINGLELINE);
-    RECT line2 = MakeRect(kPageLeft, infoTop + 18, kPageRight, infoTop + 34);
+    RECT line2 = MakeRect(kPageLeft, infoTop + 18, pageRight_, infoTop + 34);
     ui::DrawTextIn(dc, line2, L"Last full scan: " + status_.lastFullScan, fontNormal_, theme.textPrimary,
                    DT_LEFT | DT_SINGLELINE);
-    RECT line3 = MakeRect(kPageLeft, infoTop + 36, kPageRight, infoTop + 52);
+    RECT line3 = MakeRect(kPageLeft, infoTop + 36, pageRight_, infoTop + 52);
     ui::DrawTextIn(dc, line3, L"Virus definitions: " + status_.signatureVersion + L" (" + status_.lastSignatureUpdate + L")",
                    fontNormal_, theme.textPrimary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+
+void MainWindow::SetQuarantineFromThreats() {
+    quarantineRecords_.clear();
+    for (const ThreatRecord& record : threats_) {
+        if (record.statusId == 3) quarantineRecords_.push_back(record);
+    }
+    if (quarantine_) quarantine_->SetThreats(quarantineRecords_);
+}
+
+void MainWindow::PaintQuarantinePage(HDC dc) {
+    const AppTheme& theme = Theme();
+
+    RECT titleRect = MakeRect(kPageLeft, kTitleTop, pageRight_ - 90, kTitleTop + 26);
+    ui::DrawTextIn(dc, titleRect, L"Quarantine", fontTitle_, theme.textPrimary,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT subtitle = MakeRect(kPageLeft, 102, pageRight_, 118);
+    ui::DrawTextIn(dc, subtitle, L"Detections Defender moved to quarantine (MSFT_MpThreatDetection, status 3).",
+                   fontSmall_, theme.textMuted, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    if (!operationText_.empty()) {
+        RECT line = MakeRect(kPageLeft, panelBottom_ - 56, pageRight_, panelBottom_ - 38);
+        ui::DrawTextIn(dc, line, operationText_, fontBold_, operationFailed_ ? theme.warnRed : theme.brandPrimary,
+                       DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    const int noteTop = panelBottom_ - 36;
+    RECT note = MakeRect(kPageLeft, noteTop, pageRight_, noteTop + 28);
+    if (!threatsError_.empty()) {
+        ui::DrawTextIn(dc, note, threatsError_, fontSmall_, theme.warnRed, DT_LEFT | DT_TOP | DT_WORDBREAK);
+    } else if (quarantineRecords_.empty()) {
+        ui::DrawTextIn(dc, note, L"Nothing is in quarantine. Delete removes the item, Restore puts the file back, "
+                                 L"Exclude adds its path to the Defender exclusions and Reanalyze scans it again.",
+                       fontSmall_, theme.textMuted, DT_LEFT | DT_TOP | DT_WORDBREAK);
+    } else {
+        const std::wstring count = L"Items in quarantine: " + std::to_wstring(quarantineRecords_.size()) +
+                                   L"    Select one and use the buttons below.";
+        ui::DrawTextIn(dc, note, count, fontSmall_, theme.textMuted, DT_LEFT | DT_TOP | DT_WORDBREAK);
+    }
+}
+
+std::wstring FirstResourcePath(const std::wstring& resources) {
+    const size_t separator = resources.find_first_of(L";|");
+    std::wstring first = separator == std::wstring::npos ? resources : resources.substr(0, separator);
+    while (!first.empty() && (first.front() == L' ' || first.front() == L'"')) first.erase(first.begin());
+    while (!first.empty() && (first.back() == L' ' || first.back() == L'"')) first.pop_back();
+    return first;
+}
+
+void MainWindow::QuarantineAction(int command) {
+    const int index = quarantine_ ? quarantine_->Selected() : -1;
+    if (index < 0 || index >= static_cast<int>(quarantineRecords_.size())) {
+        MessageBoxW(hwnd_, L"Select an item in the quarantine list first.", L"Quarantine",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    const ThreatRecord record = quarantineRecords_[index];
+    const std::wstring path = FirstResourcePath(record.resources);
+
+    if (command == IDC_QUAR_REANALYZE) {
+        if (path.empty()) {
+            MessageBoxW(hwnd_, L"This detection has no file path to scan again.", L"Reanalyze",
+                        MB_OK | MB_ICONWARNING);
+            return;
+        }
+        StartScanOperation(3, path);
+        return;
+    }
+
+    if (command == IDC_QUAR_EXCLUDE) {
+        if (path.empty()) {
+            MessageBoxW(hwnd_, L"This detection has no file path to exclude.", L"Exclude",
+                        MB_OK | MB_ICONWARNING);
+            return;
+        }
+        const std::wstring pending = L"Adding " + path + L" to the Defender exclusions...";
+        if (demo_) {
+            operationText_ = L"Excluded " + path + L" (demo mode).";
+            operationFailed_ = false;
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+        StartOperation(pending, [path](DefenderClient& client) {
+            if (client.AddExclusion(path)) return OperationResult{L"Excluded " + path + L".", true};
+            return OperationResult{L"Cannot exclude " + path + L" - " + client.LastError(), false};
+        });
+        return;
+    }
+
+    const bool remove = command == IDC_QUAR_REMOVE;
+    const std::wstring question = remove ? L"Delete " + record.name + L" from quarantine permanently?"
+                                         : L"Restore " + record.name + L" to where it came from?";
+    if (MessageBoxW(hwnd_, question.c_str(), remove ? L"Delete" : L"Restore",
+                    MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return;
+
+    if (demo_) {
+        operationText_ = (remove ? L"Quarantine item deleted (demo mode)." : L"Quarantine item restored (demo mode).");
+        operationFailed_ = false;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+
+    const std::wstring pending = remove ? L"Deleting the quarantined item..." : L"Restoring the quarantined item...";
+    const std::wstring name = record.name;
+    StartOperation(pending, [name, remove](DefenderClient& client) {
+        const bool ok = remove ? client.RemoveThreat(name) : client.RestoreThreat(name);
+        return OperationResult{ok ? (remove ? L"Quarantine item deleted." : L"Quarantine item restored.")
+                                  : client.LastError(),
+                               ok};
+    });
 }
 
 void MainWindow::PaintReportsPage(HDC dc) {
     const AppTheme& theme = Theme();
 
-    RECT titleRect = MakeRect(kPageLeft, kTitleTop, kPageRight - 90, kTitleTop + 26);
+    RECT titleRect = MakeRect(kPageLeft, kTitleTop, pageRight_ - 90, kTitleTop + 26);
     ui::DrawTextIn(dc, titleRect, L"Activity & Threat Reports", fontTitle_, theme.textPrimary,
                    DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    RECT subtitle = MakeRect(kPageLeft, 102, kPageRight, 118);
+    RECT subtitle = MakeRect(kPageLeft, 102, pageRight_, 118);
     ui::DrawTextIn(dc, subtitle, L"MSFT_MpThreatDetection joined with the MSFT_MpThreat catalogue.",
                    fontSmall_, theme.textMuted, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-    RECT footer = MakeRect(kPageLeft, 352, kPageRight, 376);
+    const int footerTop = 352 + (clientHeight_ - kMinHeight);
+    RECT footer = MakeRect(kPageLeft, footerTop, pageRight_, footerTop + 24);
     if (!threatsError_.empty()) {
         ui::DrawTextIn(dc, footer, threatsError_, fontSmall_, theme.warnRed,
                        DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);

@@ -32,6 +32,22 @@ void EnableDpiAwareness() {
     SetProcessDPIAware();
 }
 
+// --layout WxH resizes the window once, so the reflowing layout can be captured
+// at any size without a window manager (used by the docs screenshots).
+bool HasLayoutFlag(int& width, int& height) {
+    const wchar_t* commandLine = GetCommandLineW();
+    if (commandLine == nullptr) return false;
+    const wchar_t* flag = wcsstr(commandLine, L"--layout");
+    if (flag == nullptr) return false;
+    int parsedWidth = 0;
+    int parsedHeight = 0;
+    if (swscanf_s(flag + 8, L" %dx%d", &parsedWidth, &parsedHeight) != 2) return false;
+    if (parsedWidth < 320 || parsedHeight < 200) return false;
+    width = parsedWidth;
+    height = parsedHeight;
+    return true;
+}
+
 bool HasDemoFlag() {
     const wchar_t* commandLine = GetCommandLineW();
     return commandLine != nullptr && wcsstr(commandLine, L"--demo") != nullptr;
@@ -57,6 +73,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     AppSettings settings;
     settings::Load(settings);
 
+    int layoutWidth = 0;
+    int layoutHeight = 0;
+    const bool hasLayout = HasLayoutFlag(layoutWidth, layoutHeight);
+
     MainWindow window;
     if (!window.Create(instance, settings, HasDemoFlag())) {
         CoUninitialize();
@@ -64,6 +84,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
 
     ShowWindow(window.Handle(), showCommand);
+    if (hasLayout)
+        SetWindowPos(window.Handle(), nullptr, 0, 0, layoutWidth, layoutHeight, SWP_NOMOVE | SWP_NOZORDER);
     UpdateWindow(window.Handle());
 
     MSG message = {};

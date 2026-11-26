@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ClassicDefenderUI VERSION 1.0.0 LANGUAGES CXX RC)
+project(ClassicDefenderUI VERSION 1.1.0 LANGUAGES CXX RC)
 
 if(NOT WIN32 AND NOT MINGW)
     message(FATAL_ERROR "ClassicDefenderUI targets Windows only (MSVC or MinGW-w64).")
@@ -17,11 +17,13 @@ set(APP_SOURCES
     src/main.cpp
     src/AppTheme.cpp
     src/Settings.cpp
+    src/ScanScope.cpp
     src/DefenderWmi.cpp
     src/ui/Paint.cpp
     src/ui/MainWindow.cpp
     src/ui/OptionsDialog.cpp
     src/ui/ReportsView.cpp
+    src/ui/ProgressWindow.cpp
     src/ui/FolderPicker.cpp
     ${CMAKE_BINARY_DIR}/generated/version.rc
     src/resources.rc)
@@ -78,4 +80,13 @@ if(BUILD_TESTING_TOOLS)
         target_link_options(theme_test PRIVATE -static)
     endif()
     add_test(NAME theme_test COMMAND theme_test)
+
+    add_executable(scope_test tools/scope_test.cpp src/ScanScope.cpp)
+    target_include_directories(scope_test PRIVATE src)
+    target_compile_definitions(scope_test PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+    if(NOT MSVC)
+        target_link_options(scope_test PRIVATE -static)
+    endif()
+    add_test(NAME scope_test COMMAND scope_test)
 endif()
