@@ -1,0 +1,102 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  msvc:
+    name: MSVC x64 (build + tests)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -A x64 -DBUILD_TESTING_TOOLS=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Theme and registry tests
+        run: .\build\Release\theme_test.exe
+
+      - name: Check the generated version resource
+        shell: pwsh
+        run: |
+          $exe = "build\Release\ClassicDefenderUI.exe"
+          $info = (Get-Item $exe).VersionInfo
+          $info | Format-List FileVersion, ProductVersion, ProductName, FileDescription
+          $expected = (Select-String -Path CMakeLists.txt -Pattern 'project\(ClassicDefenderUI VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          if ($info.FileVersion -ne $expected) { throw "FileVersion string '$($info.FileVersion)' != '$expected'" }
+          $numeric = "$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart)"
+          if ($numeric -ne $expected) { throw "VS_FIXEDFILEINFO '$numeric' != '$expected'" }
+
+      - name: Upload the executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClassicDefenderUI-msvc-x64
+          path: build/Release/ClassicDefenderUI.exe
+          if-no-files-found: error
+
+  mingw:
+    name: MinGW-w64 cross build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-mingw-w64-x86-64
+
+      - name: Configure and build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-mingw-w64-x86_64.cmake \
+            -DBUILD_TESTING_TOOLS=ON
+          cmake --build build
+
+      - name: Upload the executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClassicDefenderUI-mingw-x64
+          path: build/ClassicDefenderUI.exe
+          if-no-files-found: error
+
+  release:
+    name: Attach the binaries to the tag's release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [msvc, mingw]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the self-contained MinGW build
+        uses: actions/download-artifact@v4
+        with:
+          name: ClassicDefenderUI-mingw-x64
+          path: dist
+
+      - name: Attach it to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          asset="ClassicDefenderUI-${version}-win64.exe"
+          mv dist/ClassicDefenderUI.exe "$asset"
+          sha256sum "$asset"
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "Classic Defender UI $version" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
