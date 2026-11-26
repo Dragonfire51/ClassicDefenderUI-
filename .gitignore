@@ -1,0 +1,26 @@
+# Build output
+build/
+build-*/
+out/
+
+# Object and binary files
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.res
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+CMakeUserPresets.json
+
+# Agent scratch space
+.openhands/
+.agent_tmp/
