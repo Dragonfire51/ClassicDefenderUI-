@@ -10,6 +10,7 @@
 
 #include "../Async.h"
 #include "../Resource.h"
+#include "Version.h"
 #include "FolderPicker.h"
 #include "OptionsDialog.h"
 #include "Paint.h"
@@ -591,15 +592,16 @@ void MainWindow::OpenOptions() {
 }
 
 void MainWindow::ShowAbout() {
-    MessageBoxW(hwnd_,
-                L"Windows Defender AntiVirus 2002 Edition\n\n"
-                L"A classic Win32 front-end for the Microsoft Defender WMI provider "
-                L"(ROOT\\Microsoft\\Windows\\Defender).\n\n"
-                L"Status, scanning, signature updates, threat reports and folder exclusions are read from "
-                L"and written to the real engine. Colour themes are stored per user under "
-                L"HKEY_CURRENT_USER\\Software\\ClassicDefenderUI.\n\n"
-                L"Run elevated: the provider rejects most write operations otherwise.",
-                L"About this program", MB_OK | MB_ICONINFORMATION);
+    const std::wstring text =
+        L"Windows Defender AntiVirus 2002 Edition\n"
+        L"Classic Defender UI " APP_VERSION_WIDE L"\n\n"
+        L"A classic Win32 front-end for the Microsoft Defender WMI provider "
+        L"(ROOT\\Microsoft\\Windows\\Defender).\n\n"
+        L"Status, scanning, signature updates, threat reports and folder exclusions are read from "
+        L"and written to the real engine. Colour themes are stored per user under "
+        L"HKEY_CURRENT_USER\\Software\\ClassicDefenderUI.\n\n"
+        L"Run elevated: the provider rejects most write operations otherwise.";
+    MessageBoxW(hwnd_, text.c_str(), L"About this program", MB_OK | MB_ICONINFORMATION);
 }
 
 void MainWindow::RefreshStatus() {

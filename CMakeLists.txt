@@ -9,6 +9,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Single source of truth for the version: project(... VERSION x.y.z) above.
+configure_file(src/Version.h.in ${CMAKE_BINARY_DIR}/generated/Version.h @ONLY)
+configure_file(cmake/version.rc.in ${CMAKE_BINARY_DIR}/generated/version.rc @ONLY)
+
 set(APP_SOURCES
     src/main.cpp
     src/AppTheme.cpp
@@ -19,11 +23,12 @@ set(APP_SOURCES
     src/ui/OptionsDialog.cpp
     src/ui/ReportsView.cpp
     src/ui/FolderPicker.cpp
+    ${CMAKE_BINARY_DIR}/generated/version.rc
     src/resources.rc)
 
 add_executable(ClassicDefenderUI WIN32 ${APP_SOURCES})
 
-target_include_directories(ClassicDefenderUI PRIVATE src)
+target_include_directories(ClassicDefenderUI PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 
 target_compile_definitions(ClassicDefenderUI PRIVATE
     UNICODE
