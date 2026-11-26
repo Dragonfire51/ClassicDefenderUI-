@@ -1,0 +1,64 @@
+#include <windows.h>
+#include "Resource.h"
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+IDI_APPICON ICON "app.ico"
+
+IDD_OPTIONS DIALOGEX 0, 0, 398, 314
+STYLE DS_MODALFRAME | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Windows Defender Options"
+FONT 8, "Tahoma"
+BEGIN
+    GROUPBOX        "Appearance", -1, 7, 5, 384, 112
+    LTEXT           "Preset:", -1, 15, 20, 28, 9
+    COMBOBOX        IDC_OPT_PRESET, 45, 18, 150, 90, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LISTBOX         IDC_OPT_COLOR_LIST, 15, 32, 190, 72, LBS_OWNERDRAWFIXED | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Change colour...", IDC_OPT_CHANGE_COLOR, 212, 33, 120, 15
+    PUSHBUTTON      "Reset preset", IDC_OPT_RESET, 212, 52, 120, 15
+    LTEXT           "Each colour is one value under HKCU\\Software\\ClassicDefenderUI\\Theme.", -1, 212, 72, 172, 30
+
+    GROUPBOX        "Folder exclusions (MSFT_MpPreference.ExclusionPath)", -1, 7, 122, 384, 84
+    LISTBOX         IDC_OPT_EXCL_LIST, 15, 136, 244, 62, LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Add folder...", IDC_OPT_EXCL_ADD, 266, 136, 118, 15
+    PUSHBUTTON      "Remove", IDC_OPT_EXCL_REMOVE, 266, 155, 118, 15
+    LTEXT           "Paths are written straight into the Defender engine, not into a local file.", -1, 266, 174, 118, 26
+
+    GROUPBOX        "Protection", -1, 7, 211, 384, 66
+    CONTROL         "Auto-Protect (real-time monitoring)", IDC_OPT_RTP, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 15, 223, 180, 10
+    CONTROL         "Cloud-delivered protection (MAPSReporting)", IDC_OPT_CLOUD, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 15, 237, 200, 10
+    LTEXT           "Windows may refuse these writes while Tamper Protection is enabled.", -1, 15, 253, 360, 18
+
+    LTEXT           "", IDC_OPT_STATE, 15, 284, 222, 20
+    PUSHBUTTON      "Apply", ID_OPT_APPLY, 244, 285, 47, 15
+    DEFPUSHBUTTON   "OK", IDOK, 296, 285, 47, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 344, 285, 47, 15
+END
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Classic Defender UI"
+            VALUE "FileDescription", "Windows Defender AntiVirus 2002 Edition"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "ClassicDefenderUI"
+            VALUE "OriginalFilename", "ClassicDefenderUI.exe"
+            VALUE "ProductName", "Windows Defender AntiVirus 2002 Edition"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

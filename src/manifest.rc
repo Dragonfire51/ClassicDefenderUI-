@@ -1,0 +1,4 @@
+// MinGW has no /MANIFESTUAC switch: embedding the manifest as resource 1/24 is
+// the equivalent, and both the UAC level and the Common Controls v6 dependency
+// come from the same file.
+1 24 "app.manifest"
